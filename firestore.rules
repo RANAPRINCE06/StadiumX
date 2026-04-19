@@ -1,0 +1,162 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Safety Net
+    match /{document=**} { 
+      allow read, write: if false; 
+    }
+
+    // --- PRIMITIVES ---
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isSignedIn() { return request.auth != null && request.auth.token.email_verified == true; }
+    function isAdmin() { return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+
+    // --- ENTITY VALIDATION ---
+    function isValidUser(data, userId) {
+      // Identity Integrity
+      let isIdentityValid = userId == request.auth.uid;
+      
+      // Type Safety & Boundary Limits
+      let isEmailValid = data.email is string && data.email.size() >= 3 && data.email.size() <= 255;
+      // displayName is optional but if present must be validated
+      let isDisplayNameValid = !('displayName' in data) || (data.displayName is string && data.displayName.size() <= 128);
+      let isRoleValid = data.role in ['user', 'admin'];
+      let isCreatedAtValid = data.createdAt is timestamp;
+      let isUpdatedAtValid = data.updatedAt is timestamp;
+
+      return isIdentityValid && isEmailValid && isDisplayNameValid && isRoleValid && isCreatedAtValid && isUpdatedAtValid;
+    }
+
+    function isValidOrder(data) {
+      let isUserIdValid = data.userId is string && data.userId.size() <= 128 && data.userId == request.auth.uid;
+      let isItemsValid = data.items is list && data.items.size() <= 50;  
+      let isTotalValid = data.total is number && data.total >= 0;
+      let isStatusValid = data.status in ['pending', 'preparing', 'ready', 'delivered'];
+      let isCreatedAtValid = data.createdAt is timestamp;
+      let isUpdatedAtValid = data.updatedAt is timestamp;
+      
+      return isUserIdValid && isItemsValid && isTotalValid && isStatusValid && isCreatedAtValid && isUpdatedAtValid;
+    }
+
+    function isValidAlert(data) {
+      let isTitleValid = data.title is string && data.title.size() <= 128;
+      let isMessageValid = data.message is string && data.message.size() <= 1024;
+      let isPriorityValid = data.priority in ['low', 'medium', 'high', 'critical'];
+      let isStatusValid = data.status in ['active', 'resolved'];
+      let isCreatedAtValid = data.createdAt is timestamp;
+      let isUpdatedAtValid = data.updatedAt is timestamp;
+
+      return isTitleValid && isMessageValid && isPriorityValid && isStatusValid && isCreatedAtValid && isUpdatedAtValid;
+    }
+
+    // --- RULES ---
+    match /users/{userId} {
+      // 0.2 NO BLANKET READS
+      // Only the user themselves or an admin can read the user PII document.
+      // List operations must explicitly filter on the user id unless you are an admin.
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin(); 
+
+      // 2. The "Action-Based" Update Pattern
+      allow create: if 
+        isValidId(userId) &&
+        isSignedIn() &&
+        isValidUser(incoming(), userId) &&
+        (
+          // Strict Keys constraint for create
+          incoming().keys().hasAll(['email', 'role', 'createdAt', 'updatedAt']) &&
+          (incoming().keys().size() == 4 || incoming().keys().size() == 5) &&
+          // Temporal Integrity
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          // Prevent Self-Assigned Roles
+          incoming().role == 'user'
+        );
+
+      allow update: if 
+        isValidId(userId) &&
+        isSignedIn() &&
+        isValidUser(incoming(), userId) &&
+        // Immutability checks: email and createdAt cannot change
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        // Admin override or Owner action branches
+        (
+          isAdmin() || 
+          (
+            isOwner(userId) &&
+            incoming().updatedAt == request.time &&
+            // Prevent users from modifying their own role during update
+            incoming().role == existing().role &&
+            // Action: Edit Profile
+            incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])
+          )
+        );
+        
+      allow delete: if isAdmin();
+    }
+
+    match /orders/{orderId} {
+      allow get: if isValidId(orderId) && isSignedIn() && (existing().userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+
+      allow create: if 
+        isValidId(orderId) &&
+        isSignedIn() &&
+        isValidOrder(incoming()) &&
+        incoming().keys().hasAll(['userId', 'items', 'total', 'status', 'createdAt', 'updatedAt']) &&
+        incoming().keys().size() == 6 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        incoming().status == 'pending' &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+        
+      allow update: if 
+        isValidId(orderId) &&
+        isSignedIn() &&
+        isValidOrder(incoming()) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().userId == existing().userId &&
+        (
+          isAdmin() ||
+          (
+            existing().userId == request.auth.uid &&
+            incoming().updatedAt == request.time &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+          )
+        );
+        
+      allow delete: if isAdmin();
+    }
+
+    match /alerts/{alertId} {
+      allow get: if isValidId(alertId) && isSignedIn();
+      allow list: if isSignedIn();
+
+      allow create: if
+        isValidId(alertId) &&
+        isAdmin() &&
+        isValidAlert(incoming()) &&
+        incoming().keys().hasAll(['title', 'message', 'priority', 'status', 'createdAt', 'updatedAt']) &&
+        incoming().keys().size() == 6 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+        
+      allow update: if
+        isValidId(alertId) &&
+        isAdmin() &&
+        isValidAlert(incoming()) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isAdmin();
+    }
+  }
+}
